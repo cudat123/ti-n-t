@@ -1,904 +1,718 @@
+const WebSocket = require('ws');
 const express = require('express');
-const axios = require('axios');
-const path = require('path');
+const cors = require('cors');
 
-// =========== CẤU HÌNH HỆ THỐNG ===========
-const CONFIG = {
-  PORT: process.env.PORT || 3000,
-  UPDATE_INTERVAL: 5000,
-  XENG16_API: 'https://taixiu1.gsum01.com/api/luckydice1/GetSoiCau'
-};
-
-// =========== CLASS DỰ ĐOÁN ===========
-class TaiXiuPredictor {
-  constructor() {
-    this.history = [];
-    this.lastPrediction = null;
-  }
-
-  getCurrentStreak() {
-    if (this.history.length === 0) return {outcome: null, length: 0};
-    const last = this.history[this.history.length - 1];
-    let length = 1;
-    for (let i = this.history.length - 2; i >= 0; i--) {
-      if (this.history[i] === last) length++;
-      else break;
-    }
-    return {outcome: last, length};
-  }
-
-  predictNext() {
-    if (this.history.length < 3) {
-      return {prediction: Math.random() > 0.5 ? 'Tài' : 'Xỉu', confidence: 65};
+class GameWebSocketClient {
+    constructor(url) {
+        this.url = url;
+        this.ws = null;
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
+        this.reconnectDelay = 5000;
+        this.isAuthenticated = false;
+        this.sessionId = null;
+        this.latestTxData = null;   // Dữ liệu bàn tài xỉu thường (cmd 1005)
+        this.latestMd5Data = null;  // Dữ liệu bàn MD5 (cmd 1105)
+        this.lastUpdateTime = {
+            tx: null,
+            md5: null
+        };
     }
 
-    const streak = this.getCurrentStreak();
-    const streakLen = streak.length;
-    const last = streak.outcome;
-
-    // Phân tích lịch sử
-    const recent10 = this.history.slice(-10);
-    const taiCount = recent10.filter(x => x === 'Tài').length;
-    const xiuCount = recent10.filter(x => x === 'Xỉu').length;
-
-    let prediction;
-    let confidence = 70;
-
-    // Logic dự đoán
-    if (streakLen >= 3) {
-      prediction = last;
-      confidence = 75 + (streakLen * 3);
-      if (confidence > 95) confidence = 95;
-    } else if (Math.abs(taiCount - xiuCount) >= 3) {
-      prediction = taiCount > xiuCount ? 'Tài' : 'Xỉu';
-      confidence = 80;
-    } else {
-      prediction = last === 'Tài' ? 'Xỉu' : 'Tài';
-      confidence = 68;
-    }
-
-    return {prediction, confidence};
-  }
-
-  addResult(result) {
-    this.history.push(result);
-    if (this.history.length > 50) {
-      this.history.shift();
-    }
-  }
-}
-
-// =========== BIẾN TOÀN CỤC ===========
-const predictor = new TaiXiuPredictor();
-let lastSessionId = 0;
-let consecutiveLosses = 0;
-let totalPredictions = 0;
-let correctPredictions = 0;
-let lastData = null;
-
-const app = express();
-
-// =========== CẤU HÌNH TEMPLATE ENGINE ===========
-app.set('view engine', 'ejs');
-app.set('views', path.join(__dirname, 'views'));
-app.use(express.static('public'));
-
-// =========== HÀM LẤY DỮ LIỆU ===========
-async function getLatestResult() {
-  try {
-    const response = await axios.get(CONFIG.XENG16_API, {
-      timeout: 5000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0'
-      }
-    });
-    
-    if (!Array.isArray(response.data) || response.data.length === 0) {
-      return generateTestData();
-    }
-    
-    // Lấy phiên mới nhất
-    const latestRecord = response.data.reduce((prev, current) => {
-      return (prev.SessionId > current.SessionId) ? prev : current;
-    });
-    
-    const result = {
-      SessionId: latestRecord.SessionId,
-      FirstDice: latestRecord.FirstDice || 0,
-      SecondDice: latestRecord.SecondDice || 0,
-      ThirdDice: latestRecord.ThirdDice || 0,
-      DiceSum: latestRecord.DiceSum || 0,
-      BetSide: latestRecord.BetSide,
-      CreatedDate: latestRecord.CreatedDate || new Date().toISOString()
-    };
-    
-    if (result.DiceSum === 0) {
-      result.DiceSum = result.FirstDice + result.SecondDice + result.ThirdDice;
-    }
-    
-    result.KetQua = result.BetSide === 0 ? "Tài" : "Xỉu";
-    
-    return result;
-    
-  } catch (error) {
-    console.log('Lỗi API, dùng dữ liệu test');
-    return generateTestData();
-  }
-}
-
-function generateTestData() {
-  const sessionId = lastSessionId + 1;
-  const dice1 = Math.floor(Math.random() * 6) + 1;
-  const dice2 = Math.floor(Math.random() * 6) + 1;
-  const dice3 = Math.floor(Math.random() * 6) + 1;
-  const sum = dice1 + dice2 + dice3;
-  const betSide = sum >= 11 ? 0 : 1;
-  
-  return {
-    SessionId: sessionId,
-    FirstDice: dice1,
-    SecondDice: dice2,
-    ThirdDice: dice3,
-    DiceSum: sum,
-    BetSide: betSide,
-    KetQua: betSide === 0 ? "Tài" : "Xỉu",
-    CreatedDate: new Date().toISOString(),
-    isTestData: true
-  };
-}
-
-// =========== ROUTE CHÍNH API ===========
-app.get('/api', async (req, res) => {
-  try {
-    // Lấy dữ liệu
-    const currentData = await getLatestResult();
-    
-    // Kiểm tra phiên mới
-    if (currentData.SessionId > lastSessionId) {
-      // Đánh giá dự đoán trước
-      if (predictor.lastPrediction) {
-        const isCorrect = predictor.lastPrediction === currentData.KetQua;
-        totalPredictions++;
+    connect() {
+        console.log('🔗 Connecting to WebSocket server...');
         
-        if (isCorrect) {
-          correctPredictions++;
-          consecutiveLosses = 0;
-        } else {
-          consecutiveLosses++;
-        }
-      }
-      
-      // Cập nhật predictor
-      predictor.addResult(currentData.KetQua);
-      lastSessionId = currentData.SessionId;
-      lastData = currentData;
-    }
-    
-    // Tạo dự đoán mới
-    const nextPrediction = predictor.predictNext();
-    predictor.lastPrediction = nextPrediction.prediction;
-    
-    // Chiến lược
-    let strategy = "🎯 Theo cầu";
-    let strategyDetail = "Theo pattern hiện tại";
-    
-    if (consecutiveLosses >= 2) {
-      strategy = "🔄 Bẻ cầu";
-      strategyDetail = `Thua ${consecutiveLosses} lần liên tiếp`;
-      if (consecutiveLosses >= 3) {
-        nextPrediction.prediction = nextPrediction.prediction === "Tài" ? "Xỉu" : "Tài";
-        strategy = "🔄 Đảo cầu";
-        strategyDetail = `Thua ${consecutiveLosses} lần, đảo chiều dự đoán`;
-      }
-    }
-    
-    // Response API
-    const response = {
-      id: "tiendat",
-      Phien: currentData.SessionId,
-      Xuc_xac_1: currentData.FirstDice,
-      Xuc_xac_2: currentData.SecondDice,
-      Xuc_xac_3: currentData.ThirdDice,
-      Tong: currentData.DiceSum,
-      Ket_qua: currentData.KetQua,
-      phien_hien_tai: currentData.SessionId + 1,
-      du_doan: nextPrediction.prediction,
-      li_do: `Độ tin cậy: ${nextPrediction.confidence}%`,
-      confidence: nextPrediction.confidence,
-      ketqua_ddoan: predictor.lastPrediction ? 
-        (predictor.lastPrediction === currentData.KetQua ? "Đúng" : "Thua") : "Chưa có",
-      chien_luoc: strategy,
-      chien_luoc_chi_tiet: strategyDetail,
-      thong_ke: {
-        tong: totalPredictions,
-        dung: correctPredictions,
-        tile: totalPredictions > 0 ? Math.round((correctPredictions / totalPredictions) * 100) + '%' : '0%',
-        thua_lien_tiep: consecutiveLosses,
-        lich_su: predictor.history.length
-      },
-      lich_su_10: predictor.history.slice(-10),
-      is_test_data: currentData.isTestData || false
-    };
-    
-    console.log(`Phiên ${currentData.SessionId}: ${currentData.KetQua} | Dự đoán: ${nextPrediction.prediction} (${nextPrediction.confidence}%)`);
-    
-    res.json(response);
-    
-  } catch (error) {
-    console.error('Lỗi API:', error.message);
-    res.json({
-      error: "Lỗi tạm thời",
-      message: "Hệ thống đang bảo trì"
-    });
-  }
-});
-
-// =========== ROUTE GIAO DIỆN WEB ===========
-app.get('/', async (req, res) => {
-  try {
-    // Lấy dữ liệu từ API
-    const apiData = await getApiData();
-    
-    // Render giao diện
-    res.render('index', {
-      title: 'Hệ Thống Dự Đoán Tài Xỉu',
-      data: apiData,
-      lastUpdate: new Date().toLocaleTimeString('vi-VN')
-    });
-  } catch (error) {
-    console.error('Lỗi render:', error);
-    res.render('error', { error: error.message });
-  }
-});
-
-// =========== ROUTE PHỤ ===========
-app.get('/stats', (req, res) => {
-  res.json({
-    total_predictions: totalPredictions,
-    correct_predictions: correctPredictions,
-    accuracy: totalPredictions > 0 ? Math.round((correctPredictions / totalPredictions) * 100) + '%' : '0%',
-    current_streak: consecutiveLosses,
-    history_length: predictor.history.length,
-    last_session: lastSessionId,
-    predictor_history: predictor.history.slice(-20)
-  });
-});
-
-app.get('/reset', (req, res) => {
-  predictor.history = [];
-  predictor.lastPrediction = null;
-  consecutiveLosses = 0;
-  totalPredictions = 0;
-  correctPredictions = 0;
-  lastSessionId = 0;
-  lastData = null;
-  
-  res.json({ message: "Đã reset hệ thống" });
-});
-
-// =========== HÀM PHỤ TRỢ ===========
-async function getApiData() {
-  try {
-    const response = await axios.get(`http://localhost:${CONFIG.PORT}/api`);
-    return response.data;
-  } catch (error) {
-    console.log('Lỗi lấy dữ liệu API, tạo mock data');
-    return createMockData();
-  }
-}
-
-function createMockData() {
-  return {
-    Phien: 1000,
-    Xuc_xac_1: 4,
-    Xuc_xac_2: 3,
-    Xuc_xac_3: 4,
-    Tong: 11,
-    Ket_qua: "Tài",
-    phien_hien_tai: 1001,
-    du_doan: "Xỉu",
-    li_do: "Độ tin cậy: 75%",
-    confidence: 75,
-    ketqua_ddoan: "Đúng",
-    chien_luoc: "🎯 Theo cầu",
-    chien_luoc_chi_tiet: "Theo pattern hiện tại",
-    thong_ke: {
-      tong: 50,
-      dung: 35,
-      tile: "70%",
-      thua_lien_tiep: 0,
-      lich_su: 25
-    },
-    lich_su_10: ["Tài", "Xỉu", "Tài", "Tài", "Xỉu", "Tài", "Xỉu", "Xỉu", "Tài", "Tài"],
-    is_test_data: true
-  };
-}
-
-// =========== TẠO THƯ MỤC VÀ FILE VIEW ===========
-const fs = require('fs');
-const viewsDir = path.join(__dirname, 'views');
-const publicDir = path.join(__dirname, 'public');
-
-// Tạo thư mục nếu chưa tồn tại
-if (!fs.existsSync(viewsDir)) {
-  fs.mkdirSync(viewsDir, { recursive: true });
-}
-
-if (!fs.existsSync(publicDir)) {
-  fs.mkdirSync(publicDir, { recursive: true });
-}
-
-// Tạo file index.ejs
-const indexTemplate = `
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title><%= title %></title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-        
-        body {
-            background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-            color: #fff;
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-        
-        header {
-            text-align: center;
-            margin-bottom: 30px;
-            padding: 20px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 15px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-        }
-        
-        h1 {
-            color: #00d4ff;
-            font-size: 2.5rem;
-            margin-bottom: 10px;
-            text-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
-        }
-        
-        .subtitle {
-            color: #aaa;
-            font-size: 1.2rem;
-        }
-        
-        .main-content {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        
-        .card {
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 15px;
-            padding: 25px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            transition: transform 0.3s, box-shadow 0.3s;
-        }
-        
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
-        }
-        
-        .card-title {
-            color: #00d4ff;
-            font-size: 1.5rem;
-            margin-bottom: 20px;
-            padding-bottom: 10px;
-            border-bottom: 2px solid rgba(0, 212, 255, 0.3);
-        }
-        
-        .info-row {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 15px;
-            padding: 10px 0;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        .info-label {
-            color: #aaa;
-            font-weight: 500;
-        }
-        
-        .info-value {
-            color: #fff;
-            font-weight: bold;
-            font-size: 1.1rem;
-        }
-        
-        .dice-container {
-            display: flex;
-            justify-content: center;
-            gap: 20px;
-            margin: 20px 0;
-        }
-        
-        .dice {
-            width: 60px;
-            height: 60px;
-            background: rgba(255, 255, 255, 0.15);
-            border-radius: 10px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 2rem;
-            font-weight: bold;
-            color: #00d4ff;
-            border: 2px solid rgba(0, 212, 255, 0.3);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
-        }
-        
-        .result-box {
-            text-align: center;
-            padding: 20px;
-            margin: 20px 0;
-            border-radius: 10px;
-            background: rgba(0, 212, 255, 0.1);
-            border: 2px solid rgba(0, 212, 255, 0.3);
-        }
-        
-        .result-title {
-            color: #aaa;
-            font-size: 1.2rem;
-            margin-bottom: 10px;
-        }
-        
-        .result-value {
-            font-size: 2.5rem;
-            font-weight: bold;
-            color: #00d4ff;
-            text-shadow: 0 0 10px rgba(0, 212, 255, 0.5);
-        }
-        
-        .tai {
-            color: #00ff88 !important;
-            text-shadow: 0 0 10px rgba(0, 255, 136, 0.5) !important;
-        }
-        
-        .xiu {
-            color: #ff416c !important;
-            text-shadow: 0 0 10px rgba(255, 65, 108, 0.5) !important;
-        }
-        
-        .confidence-bar {
-            height: 20px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 10px;
-            margin: 20px 0;
-            overflow: hidden;
-        }
-        
-        .confidence-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #ff416c, #ff4b2b);
-            border-radius: 10px;
-            transition: width 1s ease-in-out;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            color: white;
-            font-weight: bold;
-            font-size: 0.9rem;
-        }
-        
-        .history-container {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-top: 15px;
-        }
-        
-        .history-item {
-            padding: 8px 15px;
-            border-radius: 20px;
-            font-weight: bold;
-            min-width: 60px;
-            text-align: center;
-        }
-        
-        .history-tai {
-            background: rgba(0, 255, 136, 0.2);
-            color: #00ff88;
-            border: 1px solid rgba(0, 255, 136, 0.3);
-        }
-        
-        .history-xiu {
-            background: rgba(255, 65, 108, 0.2);
-            color: #ff416c;
-            border: 1px solid rgba(255, 65, 108, 0.3);
-        }
-        
-        .strategy-box {
-            padding: 15px;
-            background: rgba(255, 193, 7, 0.1);
-            border-radius: 10px;
-            border: 1px solid rgba(255, 193, 7, 0.3);
-            margin-top: 15px;
-        }
-        
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-top: 15px;
-        }
-        
-        .stat-box {
-            background: rgba(255, 255, 255, 0.05);
-            padding: 15px;
-            border-radius: 10px;
-            text-align: center;
-        }
-        
-        .stat-value {
-            font-size: 2rem;
-            font-weight: bold;
-            color: #00d4ff;
-            margin-bottom: 5px;
-        }
-        
-        .stat-label {
-            color: #aaa;
-            font-size: 0.9rem;
-        }
-        
-        .footer {
-            text-align: center;
-            margin-top: 40px;
-            padding: 20px;
-            color: #aaa;
-            font-size: 0.9rem;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-        }
-        
-        .controls {
-            display: flex;
-            gap: 15px;
-            justify-content: center;
-            margin-top: 20px;
-        }
-        
-        .btn {
-            padding: 12px 25px;
-            border: none;
-            border-radius: 8px;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-            font-size: 1rem;
-        }
-        
-        .btn-refresh {
-            background: linear-gradient(45deg, #00d4ff, #0088ff);
-            color: white;
-        }
-        
-        .btn-reset {
-            background: linear-gradient(45deg, #ff416c, #ff4b2b);
-            color: white;
-        }
-        
-        .btn:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
-        }
-        
-        .loading {
-            text-align: center;
-            padding: 40px;
-            font-size: 1.2rem;
-            color: #00d4ff;
-        }
-        
-        @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
-            }
-            
-            h1 {
-                font-size: 2rem;
-            }
-            
-            .dice {
-                width: 50px;
-                height: 50px;
-                font-size: 1.5rem;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🎲 HỆ THỐNG DỰ ĐOÁN TÀI XỈU</h1>
-            <div class="subtitle">AI Prediction System - Cập nhật tự động mỗi 5 giây</div>
-            <div class="controls">
-                <button class="btn btn-refresh" onclick="refreshData()">🔄 Làm mới</button>
-                <button class="btn btn-reset" onclick="resetSystem()">🔄 Reset hệ thống</button>
-            </div>
-        </header>
-        
-        <div class="main-content">
-            <!-- Thông tin phiên hiện tại -->
-            <div class="card">
-                <h2 class="card-title">📊 PHIÊN HIỆN TẠI</h2>
-                <div class="info-row">
-                    <span class="info-label">Số phiên:</span>
-                    <span class="info-value">#<%= data.Phien %></span>
-                </div>
-                
-                <div class="dice-container">
-                    <div class="dice"><%= data.Xuc_xac_1 %></div>
-                    <div class="dice"><%= data.Xuc_xac_2 %></div>
-                    <div class="dice"><%= data.Xuc_xac_3 %></div>
-                </div>
-                
-                <div class="info-row">
-                    <span class="info-label">Tổng điểm:</span>
-                    <span class="info-value"><%= data.Tong %></span>
-                </div>
-                
-                <div class="result-box">
-                    <div class="result-title">KẾT QUẢ</div>
-                    <div class="result-value <%= data.Ket_qua === 'Tài' ? 'tai' : 'xiu' %>">
-                        <%= data.Ket_qua %>
-                    </div>
-                </div>
-                
-                <div class="info-row">
-                    <span class="info-label">Loại dữ liệu:</span>
-                    <span class="info-value"><%= data.is_test_data ? 'Dữ liệu test' : 'Dữ liệu thực' %></span>
-                </div>
-            </div>
-            
-            <!-- Dự đoán phiên tiếp theo -->
-            <div class="card">
-                <h2 class="card-title">🔮 DỰ ĐOÁN PHIÊN #<%= data.phien_hien_tai %></h2>
-                
-                <div class="result-box">
-                    <div class="result-title">DỰ ĐOÁN TIẾP THEO</div>
-                    <div class="result-value <%= data.du_doan === 'Tài' ? 'tai' : 'xiu' %>">
-                        <%= data.du_doan %>
-                    </div>
-                </div>
-                
-                <div class="info-row">
-                    <span class="info-label">Độ tin cậy:</span>
-                    <span class="info-value"><%= data.confidence %>%</span>
-                </div>
-                
-                <div class="confidence-bar">
-                    <div class="confidence-fill" id="confidenceFill" style="width: <%= data.confidence %>%">
-                        <%= data.confidence %>%
-                    </div>
-                </div>
-                
-                <div class="info-row">
-                    <span class="info-label">Kết quả dự đoán trước:</span>
-                    <span class="info-value" style="color: <%= data.ketqua_ddoan === 'Đúng' ? '#00ff88' : '#ff416c' %>">
-                        <%= data.ketqua_ddoan %>
-                    </span>
-                </div>
-                
-                <div class="strategy-box">
-                    <div style="color: #ffc107; font-weight: bold; margin-bottom: 5px;">
-                        <%= data.chien_luoc %>
-                    </div>
-                    <div style="color: #aaa; font-size: 0.9rem;">
-                        <%= data.chien_luoc_chi_tiet %>
-                    </div>
-                </div>
-            </div>
-            
-            <!-- Thống kê & Lịch sử -->
-            <div class="card">
-                <h2 class="card-title">📈 THỐNG KÊ HỆ THỐNG</h2>
-                
-                <div class="stats-grid">
-                    <div class="stat-box">
-                        <div class="stat-value"><%= data.thong_ke.tong %></div>
-                        <div class="stat-label">Tổng dự đoán</div>
-                    </div>
-                    
-                    <div class="stat-box">
-                        <div class="stat-value"><%= data.thong_ke.dung %></div>
-                        <div class="stat-label">Dự đoán đúng</div>
-                    </div>
-                    
-                    <div class="stat-box">
-                        <div class="stat-value"><%= data.thong_ke.tile %></div>
-                        <div class="stat-label">Tỷ lệ chính xác</div>
-                    </div>
-                    
-                    <div class="stat-box">
-                        <div class="stat-value"><%= data.thong_ke.thua_lien_tiep %></div>
-                        <div class="stat-label">Thua liên tiếp</div>
-                    </div>
-                </div>
-                
-                <h3 style="margin-top: 25px; color: #00d4ff; font-size: 1.2rem;">📜 LỊCH SỬ 10 PHIÊN GẦN NHẤT</h3>
-                <div class="history-container">
-                    <% data.lich_su_10.forEach(function(item, index) { %>
-                        <div class="history-item <%= item === 'Tài' ? 'history-tai' : 'history-xiu' %>">
-                            <%= item === 'Tài' ? 'T' : 'X' %>
-                        </div>
-                    <% }); %>
-                </div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>🕐 Cập nhật lần cuối: <%= lastUpdate %></p>
-            <p>🔗 API Endpoint: <a href="/api" style="color: #00d4ff;">/api</a> | <a href="/stats" style="color: #00d4ff;">/stats</a></p>
-            <p style="margin-top: 10px; font-size: 0.8rem; color: #666;">
-                Hệ thống tự động cập nhật mỗi 5 giây | ID: <%= data.id %>
-            </p>
-        </div>
-    </div>
-    
-    <script>
-        // Tự động làm mới trang mỗi 5 giây
-        setTimeout(() => {
-            window.location.reload();
-        }, 5000);
-        
-        // Hàm làm mới dữ liệu
-        function refreshData() {
-            window.location.reload();
-        }
-        
-        // Hàm reset hệ thống
-        function resetSystem() {
-            if (confirm('Bạn có chắc muốn reset toàn bộ hệ thống? Dữ liệu sẽ bị xóa hết.')) {
-                fetch('/reset')
-                    .then(response => response.json())
-                    .then(data => {
-                        alert('Đã reset hệ thống thành công!');
-                        window.location.reload();
-                    })
-                    .catch(error => {
-                        alert('Lỗi khi reset hệ thống!');
-                    });
-            }
-        }
-        
-        // Hiệu ứng cho thanh độ tin cậy
-        document.addEventListener('DOMContentLoaded', function() {
-            const confidenceFill = document.getElementById('confidenceFill');
-            const confidence = <%= data.confidence %>;
-            
-            // Đổi màu thanh độ tin cậy dựa trên giá trị
-            if (confidence >= 80) {
-                confidenceFill.style.background = 'linear-gradient(90deg, #00ff88, #00d4ff)';
-            } else if (confidence >= 70) {
-                confidenceFill.style.background = 'linear-gradient(90deg, #ffc107, #ff9800)';
-            } else {
-                confidenceFill.style.background = 'linear-gradient(90deg, #ff416c, #ff4b2b)';
+        this.ws = new WebSocket(this.url, {
+            headers: {
+                'Host': 'api.apibinh.xyz',
+                'Origin': 'https://play.tik88.vin',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+                'Pragma': 'no-cache',
+                'Cache-Control': 'no-cache',
+                'Accept-Encoding': 'gzip, deflate, br, zstd',
+                'Accept-Language': 'vi-VN,vi;q=0.9,fr-FR;q=0.8,fr;q=0.7,en-US;q=0.6,en;q=0.5',
+                'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits',
+                'Sec-WebSocket-Version': '13'
             }
         });
-    </script>
-</body>
-</html>
-`;
 
-// Tạo file error.ejs
-const errorTemplate = `
-<!DOCTYPE html>
-<html lang="vi">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lỗi hệ thống</title>
-    <style>
-        body {
-            background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
-            color: #fff;
-            height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            text-align: center;
-            padding: 20px;
-        }
-        .error-container {
-            background: rgba(255, 255, 255, 0.1);
-            padding: 40px;
-            border-radius: 15px;
-            backdrop-filter: blur(10px);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            max-width: 600px;
-        }
-        h1 {
-            color: #ff416c;
-            font-size: 3rem;
-            margin-bottom: 20px;
-        }
-        p {
-            font-size: 1.2rem;
-            margin-bottom: 30px;
-            color: #aaa;
-        }
-        .btn {
-            padding: 12px 30px;
-            background: linear-gradient(45deg, #00d4ff, #0088ff);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-weight: bold;
-            cursor: pointer;
-            font-size: 1rem;
-            text-decoration: none;
-            display: inline-block;
-        }
-    </style>
-</head>
-<body>
-    <div class="error-container">
-        <h1>⚠️ LỖI HỆ THỐNG</h1>
-        <p><%= error %></p>
-        <p>Vui lòng thử lại sau hoặc liên hệ quản trị viên.</p>
-        <a href="/" class="btn">Quay lại trang chủ</a>
-    </div>
-</body>
-</html>
-`;
-
-// Ghi file template
-fs.writeFileSync(path.join(viewsDir, 'index.ejs'), indexTemplate);
-fs.writeFileSync(path.join(viewsDir, 'error.ejs'), errorTemplate);
-
-// =========== KHỞI ĐỘNG SERVER ===========
-app.listen(CONFIG.PORT, () => {
-  console.log('╔══════════════════════════════════════════════════════════════╗');
-  console.log('║               HỆ THỐNG DỰ ĐOÁN TÀI XỈU                     ║');
-  console.log('╠══════════════════════════════════════════════════════════════╣');
-  console.log(`║  🌐 Web Interface: http://localhost:${CONFIG.PORT}              ║`);
-  console.log(`║  📊 API Endpoint:  http://localhost:${CONFIG.PORT}/api          ║`);
-  console.log(`║  📈 Stats:         http://localhost:${CONFIG.PORT}/stats        ║`);
-  console.log(`║  ⏱️  Tự động cập nhật: ${CONFIG.UPDATE_INTERVAL/1000} giây/lần   ║`);
-  console.log('╚══════════════════════════════════════════════════════════════╝');
-  console.log('\n📌 Đang chạy hệ thống...');
-  
-  // Tự động cập nhật định kỳ
-  setInterval(async () => {
-    try {
-      await axios.get(`http://localhost:${CONFIG.PORT}/api`);
-      console.log(`🔄 [${new Date().toLocaleTimeString('vi-VN')}] Tự động cập nhật thành công`);
-    } catch (error) {
-      console.log(`⚠️  [${new Date().toLocaleTimeString('vi-VN')}] Lỗi cập nhật: ${error.message}`);
+        this.setupEventHandlers();
     }
-  }, CONFIG.UPDATE_INTERVAL);
+
+    setupEventHandlers() {
+        this.ws.on('open', () => {
+            console.log('✅ Connected to WebSocket server');
+            this.reconnectAttempts = 0;
+            this.sendAuthentication();
+        });
+
+        this.ws.on('message', (data) => {
+            this.handleMessage(data);
+        });
+
+        this.ws.on('error', (error) => {
+            console.error('❌ WebSocket error:', error.message);
+        });
+
+        this.ws.on('close', (code, reason) => {
+            console.log(`🔌 Connection closed. Code: ${code}, Reason: ${reason}`);
+            this.isAuthenticated = false;
+            this.sessionId = null;
+            this.handleReconnect();
+        });
+
+        this.ws.on('pong', () => {
+            console.log('❤️  Heartbeat received from server');
+        });
+    }
+
+    sendAuthentication() {
+        console.log('🔐 Sending authentication...');
+        
+        const authMessage = [
+    1,
+    "MiniGame",
+    "wanglin20199",
+    "WangFlang1",
+    {
+        "signature": "2FA6B74B8FAF7CD5862E0C5A70394D5D3873D21AF37143F3722D77A9B5E058B1AAD096D27271BEEFB6B495656C6409C8A826FC582CD85250B8C1BD2E9ED4C39FC836BFD196930C8D5F82582D80E0C4C86E974DF6F37743E84FE50745E461E65FC2954C6965FECF9DB22C132F80E9300859F4FB9A183BB286EC858C656D2D7392",
+        "info": {
+            "cs": "31aee17e47e7f3f8da6b56e9dea07567",
+            "phone": "84854677721",
+            "ipAddress": "113.185.40.84",
+            "isMerchant": false,
+            "userId": "a66bbc5a-b8a8-4ba1-a442-7573d25a74ee",
+            "deviceId": "050105373614200053736078036024",
+            "branch": "go789",
+            "isMktAccount": false,
+            "username": "wanglin20199",
+            "timestamp": 1766536541986
+        },
+        "pid": 4
+            }
+        ];
+
+        this.sendRaw(authMessage);
+    }
+
+    sendPluginMessages() {
+        console.log('🚀 Sending plugin initialization messages...');
+        
+        const pluginMessages = [
+            [
+                6,
+                "MiniGame",
+                "taixiuPlugin",
+                {
+                    "cmd": 1005
+                }
+            ],
+            [
+                6,
+                "MiniGame",
+                "taixiuMd5Plugin",
+                {
+                    "cmd": 1105
+                }
+            ],
+            [
+                6,
+                "MiniGame",
+                "taixiuLiveRoomPlugin",
+                {
+                    "cmd": 1305,
+                    "rid": 0
+                }
+            ],
+            [
+                6,
+                "MiniGame",
+                "taixiuMd5v2Plugin",
+                {
+                    "cmd": 1405
+                }
+            ],
+            [
+                6,
+                "MiniGame",
+                "lobbyPlugin",
+                {
+                    "cmd": 10001
+                }
+            ]
+        ];
+
+        pluginMessages.forEach((message, index) => {
+            setTimeout(() => {
+                console.log(`📤 Sending plugin ${index + 1}/${pluginMessages.length}: ${message[2]}`);
+                this.sendRaw(message);
+            }, index * 1000);
+        });
+
+        // Thiết lập interval để refresh dữ liệu mỗi 30 giây
+        setInterval(() => {
+            this.refreshGameData();
+        }, 30000);
+    }
+
+    refreshGameData() {
+        if (this.isAuthenticated && this.ws && this.ws.readyState === WebSocket.OPEN) {
+            console.log('🔄 Refreshing game data...');
+            
+            // Gửi refresh cả 2 bàn
+            const refreshTx = [
+                6,
+                "MiniGame",
+                "taixiuPlugin",
+                {
+                    "cmd": 1005
+                }
+            ];
+            
+            const refreshMd5 = [
+                6,
+                "MiniGame",
+                "taixiuMd5Plugin",
+                {
+                    "cmd": 1105
+                }
+            ];
+            
+            this.sendRaw(refreshTx);
+            setTimeout(() => {
+                this.sendRaw(refreshMd5);
+            }, 1000);
+        }
+    }
+
+    sendRaw(data) {
+        if (this.ws.readyState === WebSocket.OPEN) {
+            const jsonString = JSON.stringify(data);
+            this.ws.send(jsonString);
+            console.log('📤 Sent raw:', jsonString);
+            return true;
+        } else {
+            console.log('⚠️ Cannot send, WebSocket not open');
+            return false;
+        }
+    }
+
+    handleMessage(data) {
+        try {
+            const parsed = JSON.parse(data);
+            
+            // XỬ LÝ CMD 1005 - BÀN TÀI XỈU THƯỜNG
+            if (parsed[0] === 5 && parsed[1] && parsed[1].cmd === 1005) {
+                console.log('🎯 Nhận được dữ liệu cmd 1005 (Bàn TX)');
+                
+                const gameData = parsed[1];
+                
+                if (gameData.htr && gameData.htr.length > 0) {
+                    // Tìm phiên gần nhất
+                    const latestSession = gameData.htr.reduce((prev, current) => {
+                        return (current.sid > prev.sid) ? current : prev;
+                    });
+                    
+                    console.log(`🎲 Bàn TX - Phiên gần nhất: ${latestSession.sid} (${latestSession.d1},${latestSession.d2},${latestSession.d3})`);
+                    
+                    // Lưu dữ liệu
+                    this.latestTxData = gameData;
+                    this.lastUpdateTime.tx = new Date();
+                    console.log('💾 Đã cập nhật dữ liệu bàn TX');
+                }
+            }
+            
+            // XỬ LÝ CMD 1105 - BÀN MD5
+            else if (parsed[0] === 5 && parsed[1] && parsed[1].cmd === 1105) {
+                console.log('🎯 Nhận được dữ liệu cmd 1105 (Bàn MD5)');
+                
+                const gameData = parsed[1];
+                
+                if (gameData.htr && gameData.htr.length > 0) {
+                    // Tìm phiên gần nhất
+                    const latestSession = gameData.htr.reduce((prev, current) => {
+                        return (current.sid > prev.sid) ? current : prev;
+                    });
+                    
+                    console.log(`🎲 Bàn MD5 - Phiên gần nhất: ${latestSession.sid} (${latestSession.d1},${latestSession.d2},${latestSession.d3})`);
+                    
+                    // Lưu dữ liệu
+                    this.latestMd5Data = gameData;
+                    this.lastUpdateTime.md5 = new Date();
+                    console.log('💾 Đã cập nhật dữ liệu bàn MD5');
+                }
+            }
+            
+            // Xử lý response authentication (type 5 nhưng không có cmd)
+            else if (parsed[0] === 5 && parsed[1] && parsed[1].u) {
+                console.log('🔑 Authentication successful!');
+                
+                const userData = parsed[1];
+                console.log(`✅ User: ${userData.u}`);
+                this.isAuthenticated = true;
+                
+                // Sau khi xác thực thành công, đợi 2 giây rồi gửi plugin messages
+                setTimeout(() => {
+                    console.log('🔄 Starting to send plugin messages...');
+                    this.sendPluginMessages();
+                }, 2000);
+            }
+            
+            // Xử lý response type 1 - Session initialization
+            else if (parsed[0] === 1 && parsed[4] === "MiniGame") {
+                console.log('✅ Session initialized');
+                this.sessionId = parsed[3];
+                console.log(`📋 Session ID: ${this.sessionId}`);
+            }
+            
+            // Xử lý response type 7 - Plugin response
+            else if (parsed[0] === 7) {
+                const pluginName = parsed[2];
+                console.log(`🔄 Plugin ${pluginName} response received`);
+            }
+            
+            // Xử lý heartbeat/ping response
+            else if (parsed[0] === 0) {
+                console.log('❤️  Heartbeat received');
+            }
+            
+        } catch (e) {
+            console.log('📥 Raw message:', data.toString());
+            console.error('❌ Parse error:', e.message);
+        }
+    }
+
+    // Hàm lấy phiên gần nhất từ bàn TX
+    getLatestTxSession() {
+        if (!this.latestTxData || !this.latestTxData.htr || this.latestTxData.htr.length === 0) {
+            return {
+                error: "Không có dữ liệu bàn TX",
+                message: "Chưa nhận được dữ liệu từ server hoặc dữ liệu trống"
+            };
+        }
+
+        try {
+            // Lấy phiên gần nhất (sid cao nhất)
+            const latestSession = this.latestTxData.htr.reduce((prev, current) => {
+                return (current.sid > prev.sid) ? current : prev;
+            });
+
+            // Tính tổng và xác định kết quả
+            const tong = latestSession.d1 + latestSession.d2 + latestSession.d3;
+            const ket_qua = (tong >= 11 && tong <= 18) ? "tài" : "xỉu";
+
+            return {
+                phien: latestSession.sid,
+                xuc_xac_1: latestSession.d1,
+                xuc_xac_2: latestSession.d2,
+                xuc_xac_3: latestSession.d3,
+                tong: tong,
+                ket_qua: ket_qua,
+                timestamp: new Date().toISOString(),
+                ban: "tai_xiu",
+                last_updated: this.lastUpdateTime.tx ? this.lastUpdateTime.tx.toISOString() : null
+            };
+        } catch (error) {
+            return {
+                error: "Lỗi xử lý dữ liệu TX",
+                message: error.message
+            };
+        }
+    }
+
+    // Hàm lấy phiên gần nhất từ bàn MD5
+    getLatestMd5Session() {
+        if (!this.latestMd5Data || !this.latestMd5Data.htr || this.latestMd5Data.htr.length === 0) {
+            return {
+                error: "Không có dữ liệu bàn MD5",
+                message: "Chưa nhận được dữ liệu từ server hoặc dữ liệu trống"
+            };
+        }
+
+        try {
+            // Lấy phiên gần nhất (sid cao nhất)
+            const latestSession = this.latestMd5Data.htr.reduce((prev, current) => {
+                return (current.sid > prev.sid) ? current : prev;
+            });
+
+            // Tính tổng và xác định kết quả
+            const tong = latestSession.d1 + latestSession.d2 + latestSession.d3;
+            const ket_qua = (tong >= 11 && tong <= 18) ? "tài" : "xỉu";
+
+            return {
+                phien: latestSession.sid,
+                xuc_xac_1: latestSession.d1,
+                xuc_xac_2: latestSession.d2,
+                xuc_xac_3: latestSession.d3,
+                tong: tong,
+                ket_qua: ket_qua,
+                timestamp: new Date().toISOString(),
+                ban: "md5",
+                last_updated: this.lastUpdateTime.md5 ? this.lastUpdateTime.md5.toISOString() : null
+            };
+        } catch (error) {
+            return {
+                error: "Lỗi xử lý dữ liệu MD5",
+                message: error.message
+            };
+        }
+    }
+
+    handleReconnect() {
+        if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            this.reconnectAttempts++;
+            const delay = this.reconnectDelay * this.reconnectAttempts;
+            
+            console.log(`🔄 Attempting to reconnect in ${delay}ms (Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+            
+            setTimeout(() => {
+                console.log('🔄 Reconnecting...');
+                this.connect();
+            }, delay);
+        } else {
+            console.log('❌ Max reconnection attempts reached');
+        }
+    }
+
+    startHeartbeat() {
+        setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                const heartbeatMsg = [0, this.sessionId || ""];
+                this.ws.send(JSON.stringify(heartbeatMsg));
+                console.log('❤️  Sending heartbeat...');
+            }
+        }, 25000);
+    }
+
+    close() {
+        if (this.ws) {
+            this.ws.close();
+        }
+    }
+}
+
+// KHỞI TẠO EXPRESS SERVER
+const app = express();
+const PORT = 3012;
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// Tạo WebSocket client - URL MỚI
+const client = new GameWebSocketClient(
+    'wss://api.apibinh.xyz/websocket?d=YW1SdWFXSnVhQT09fDJ8MTc2NjUzNjU0MTM3MHw0YTAxZjZhY2JjMGRhYjhkNWE1YzM3YzVjMmVlM2JjYXwyZmQ4Y2ZmZmM1NDQ5MGY3N2QyODg5ZWIyM2IzZGFlYg=='
+);
+
+// Kết nối WebSocket
+client.connect();
+
+// Route để lấy phiên gần nhất từ bàn TX
+app.get('/api/tx', (req, res) => {
+    try {
+        const latestSession = client.getLatestTxSession();
+        
+        if (latestSession.error) {
+            return res.status(404).json(latestSession);
+        }
+        
+        res.json(latestSession);
+    } catch (error) {
+        res.status(500).json({
+            error: "Lỗi server",
+            message: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
 });
 
-// Xử lý khi tắt server
-process.on('SIGINT', () => {
-  console.log('\n\n📊 Thống kê cuối cùng:');
-  console.log(`   Tổng dự đoán: ${totalPredictions}`);
-  console.log(`   Dự đoán đúng: ${correctPredictions}`);
-  console.log(`   Tỷ lệ đúng: ${totalPredictions > 0 ? Math.round((correctPredictions / totalPredictions) * 100) : 0}%`);
-  console.log(`   Lịch sử lưu: ${predictor.history.length} kết quả`);
-  console.log('\n👋 Tắt server...');
-  process.exit(0);
+// Route để lấy phiên gần nhất từ bàn MD5
+app.get('/api/md5', (req, res) => {
+    try {
+        const latestSession = client.getLatestMd5Session();
+        
+        if (latestSession.error) {
+            return res.status(404).json(latestSession);
+        }
+        
+        res.json(latestSession);
+    } catch (error) {
+        res.status(500).json({
+            error: "Lỗi server",
+            message: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
 });
+
+// Route để lấy cả 2 bàn
+app.get('/api/all', (req, res) => {
+    try {
+        const txSession = client.getLatestTxSession();
+        const md5Session = client.getLatestMd5Session();
+        
+        res.json({
+            tai_xiu: txSession.error ? { error: txSession.error } : txSession,
+            md5: md5Session.error ? { error: md5Session.error } : md5Session,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: "Lỗi server",
+            message: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
+});
+
+// Route kiểm tra trạng thái
+app.get('/api/status', (req, res) => {
+    const hasTxData = client.latestTxData && 
+                     client.latestTxData.htr && 
+                     client.latestTxData.htr.length > 0;
+    
+    const hasMd5Data = client.latestMd5Data && 
+                      client.latestMd5Data.htr && 
+                      client.latestMd5Data.htr.length > 0;
+    
+    res.json({
+        status: "running",
+        websocket_connected: client.ws ? client.ws.readyState === WebSocket.OPEN : false,
+        authenticated: client.isAuthenticated,
+        has_tx_data: hasTxData,
+        has_md5_data: hasMd5Data,
+        tx_data_count: hasTxData ? client.latestTxData.htr.length : 0,
+        md5_data_count: hasMd5Data ? client.latestMd5Data.htr.length : 0,
+        tx_latest_sid: hasTxData ? 
+            client.latestTxData.htr.reduce((p, c) => c.sid > p.sid ? c : p).sid : 
+            null,
+        md5_latest_sid: hasMd5Data ? 
+            client.latestMd5Data.htr.reduce((p, c) => c.sid > p.sid ? c : p).sid : 
+            null,
+        tx_last_updated: client.lastUpdateTime.tx ? client.lastUpdateTime.tx.toISOString() : null,
+        md5_last_updated: client.lastUpdateTime.md5 ? client.lastUpdateTime.md5.toISOString() : null,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Route refresh dữ liệu
+app.get('/api/refresh', (req, res) => {
+    if (client.isAuthenticated && client.ws && client.ws.readyState === WebSocket.OPEN) {
+        client.refreshGameData();
+        
+        res.json({
+            message: "Đã gửi yêu cầu refresh dữ liệu cả 2 bàn",
+            timestamp: new Date().toISOString()
+        });
+    } else {
+        res.status(400).json({
+            error: "Không thể refresh",
+            message: "WebSocket chưa kết nối hoặc chưa xác thực"
+        });
+    }
+});
+
+// Route trang chủ
+app.get('/', (req, res) => {
+    res.send(`
+        <html>
+            <head>
+                <title>🎲 Sảnh Tài Xỉu - API</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 40px; background: #f0f2f5; }
+                    h1 { color: #333; text-align: center; }
+                    .container { max-width: 900px; margin: 0 auto; }
+                    .endpoint { background: white; padding: 20px; border-radius: 10px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+                    code { background: #e0e0e0; padding: 2px 5px; border-radius: 3px; font-family: monospace; }
+                    .api-link { color: #1890ff; text-decoration: none; }
+                    .api-link:hover { text-decoration: underline; }
+                    .status { padding: 10px; border-radius: 5px; margin: 10px 0; }
+                    .connected { background: #d4edda; color: #155724; }
+                    .disconnected { background: #f8d7da; color: #721c24; }
+                    .btn { background: #1890ff; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; margin: 5px; }
+                    .btn:hover { background: #40a9ff; }
+                    .board { display: inline-block; padding: 10px; margin: 5px; border-radius: 5px; }
+                    .board-tx { background: #e6f7ff; border: 1px solid #91d5ff; }
+                    .board-md5 { background: #f6ffed; border: 1px solid #b7eb8f; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🎲 Sảnh Tài Xỉu - API</h1>
+                    
+                    <div id="status" class="endpoint">
+                        <h2>📡 Đang kiểm tra trạng thái...</h2>
+                    </div>
+                    
+                    <div class="endpoint">
+                        <h2>📊 API Endpoints:</h2>
+                        <ul>
+                            <li><code>GET <a class="api-link" href="/api/tx" target="_blank">/api/tx</a></code> - Bàn Tài Xỉu thường</li>
+                            <li><code>GET <a class="api-link" href="/api/md5" target="_blank">/api/md5</a></code> - Bàn MD5</li>
+                            <li><code>GET <a class="api-link" href="/api/all" target="_blank">/api/all</a></code> - Cả 2 bàn</li>
+                            <li><code>GET <a class="api-link" href="/api/status" target="_blank">/api/status</a></code> - Trạng thái</li>
+                            <li><code>GET <a class="api-link" href="/api/refresh" target="_blank">/api/refresh</a></code> - Refresh dữ liệu</li>
+                        </ul>
+                    </div>
+                    
+                    <div class="endpoint">
+                        <h2>🎯 Quick Actions:</h2>
+                        <button class="btn" onclick="getTX()">🎲 Lấy Bàn TX</button>
+                        <button class="btn" onclick="getMD5()">🔐 Lấy Bàn MD5</button>
+                        <button class="btn" onclick="getAll()">📊 Lấy Cả 2</button>
+                        <button class="btn" onclick="refreshData()">🔄 Refresh Data</button>
+                    </div>
+                    
+                    <div class="endpoint">
+                        <h2>🔗 Quick Links:</h2>
+                        <p><strong>Localhost:</strong> <a class="api-link" href="http://localhost:${PORT}/api/tx" target="_blank">http://localhost:${PORT}/api/tx</a></p>
+                        <p><strong>Network:</strong> http://[YOUR_IP]:${PORT}/api/tx</p>
+                    </div>
+                    
+                    <div id="data-display" class="endpoint">
+                        <h2>📋 Data Display:</h2>
+                        <div id="tx-data"></div>
+                        <div id="md5-data"></div>
+                    </div>
+                </div>
+                
+                <script>
+                    // Kiểm tra trạng thái và cập nhật liên tục
+                    function updateStatus() {
+                        fetch('/api/status')
+                            .then(response => response.json())
+                            .then(data => {
+                                const statusDiv = document.getElementById('status');
+                                const isConnected = data.websocket_connected;
+                                const hasTxData = data.has_tx_data;
+                                const hasMd5Data = data.has_md5_data;
+                                
+                                statusDiv.innerHTML = \`
+                                    <h2>📡 Trạng thái hệ thống:</h2>
+                                    <div class="status \${isConnected ? 'connected' : 'disconnected'}">
+                                        <p><strong>WebSocket:</strong> \${isConnected ? '✅ Đã kết nối' : '❌ Mất kết nối'}</p>
+                                        <p><strong>Xác thực:</strong> \${data.authenticated ? '✅ Đã xác thực' : '⏳ Chưa xác thực'}</p>
+                                        <div class="board board-tx">
+                                            <p><strong>Bàn TX:</strong> \${hasTxData ? '✅ Có dữ liệu (' + data.tx_data_count + ' phiên)' : '⏳ Đang chờ'}</p>
+                                            \${data.tx_latest_sid ? '<p>Phiên mới nhất: ' + data.tx_latest_sid + '</p>' : ''}
+                                            \${data.tx_last_updated ? '<p>Cập nhật: ' + new Date(data.tx_last_updated).toLocaleTimeString() + '</p>' : ''}
+                                        </div>
+                                        <div class="board board-md5">
+                                            <p><strong>Bàn MD5:</strong> \${hasMd5Data ? '✅ Có dữ liệu (' + data.md5_data_count + ' phiên)' : '⏳ Đang chờ'}</p>
+                                            \${data.md5_latest_sid ? '<p>Phiên mới nhất: ' + data.md5_latest_sid + '</p>' : ''}
+                                            \${data.md5_last_updated ? '<p>Cập nhật: ' + new Date(data.md5_last_updated).toLocaleTimeString() + '</p>' : ''}
+                                        </div>
+                                    </div>
+                                \`;
+                                
+                                // Tự động lấy dữ liệu nếu có
+                                if (hasTxData) getTX();
+                                if (hasMd5Data) getMD5();
+                            })
+                            .catch(error => {
+                                console.error('Error:', error);
+                            });
+                    }
+                    
+                    function getTX() {
+                        fetch('/api/tx')
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.error) {
+                                    document.getElementById('tx-data').innerHTML = \`
+                                        <div class="board board-tx">
+                                            <h3>🎲 Bàn Tài Xỉu</h3>
+                                            <p>❌ \${data.error}</p>
+                                        </div>
+                                    \`;
+                                } else {
+                                    document.getElementById('tx-data').innerHTML = \`
+                                        <div class="board board-tx">
+                                            <h3>🎲 Bàn Tài Xỉu</h3>
+                                            <p><strong>Phiên:</strong> \${data.phien}</p>
+                                            <p><strong>Xúc xắc:</strong> \${data.xuc_xac_1}, \${data.xuc_xac_2}, \${data.xuc_xac_3}</p>
+                                            <p><strong>Tổng:</strong> \${data.tong} (<span style="color: \${data.ket_qua === 'tài' ? 'red' : 'blue'}">\${data.ket_qua}</span>)</p>
+                                            <p><strong>Thời gian:</strong> \${new Date(data.timestamp).toLocaleTimeString()}</p>
+                                        </div>
+                                    \`;
+                                }
+                            });
+                    }
+                    
+                    function getMD5() {
+                        fetch('/api/md5')
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.error) {
+                                    document.getElementById('md5-data').innerHTML = \`
+                                        <div class="board board-md5">
+                                            <h3>🔐 Bàn MD5</h3>
+                                            <p>❌ \${data.error}</p>
+                                        </div>
+                                    \`;
+                                } else {
+                                    document.getElementById('md5-data').innerHTML = \`
+                                        <div class="board board-md5">
+                                            <h3>🔐 Bàn MD5</h3>
+                                            <p><strong>Phiên:</strong> \${data.phien}</p>
+                                            <p><strong>Xúc xắc:</strong> \${data.xuc_xac_1}, \${data.xuc_xac_2}, \${data.xuc_xac_3}</p>
+                                            <p><strong>Tổng:</strong> \${data.tong} (<span style="color: \${data.ket_qua === 'tài' ? 'red' : 'blue'}">\${data.ket_qua}</span>)</p>
+                                            <p><strong>Thời gian:</strong> \${new Date(data.timestamp).toLocaleTimeString()}</p>
+                                        </div>
+                                    \`;
+                                }
+                            });
+                    }
+                    
+                    function getAll() {
+                        getTX();
+                        getMD5();
+                    }
+                    
+                    function refreshData() {
+                        fetch('/api/refresh')
+                            .then(response => response.json())
+                            .then(data => {
+                                alert(data.message);
+                                setTimeout(updateStatus, 2000);
+                            });
+                    }
+                    
+                    // Cập nhật mỗi 5 giây
+                    updateStatus();
+                    setInterval(updateStatus, 5000);
+                    
+                    // Tự động lấy dữ liệu ban đầu
+                    setTimeout(() => {
+                        getTX();
+                        getMD5();
+                    }, 3000);
+                </script>
+            </body>
+        </html>
+    `);
+});
+
+// Khởi động server
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Server đang chạy tại: http://localhost:${PORT}`);
+    console.log(`🎲 API Bàn TX: http://localhost:${PORT}/api/tx`);
+    console.log(`🔐 API Bàn MD5: http://localhost:${PORT}/api/md5`);
+    console.log(`📊 API Cả 2 bàn: http://localhost:${PORT}/api/all`);
+    console.log(`📡 Status: http://localhost:${PORT}/api/status`);
+    console.log(`🌐 Truy cập từ mạng nội bộ: http://[YOUR_IP]:${PORT}`);
+});
+
+// Bắt đầu heartbeat sau khi kết nối
+setTimeout(() => {
+    client.startHeartbeat();
+}, 10000);
+
+// Xử lý tắt chương trình
+process.on('SIGINT', () => {
+    console.log('\n👋 Closing WebSocket connection and server...');
+    client.close();
+    process.exit();
+});
+
+module.exports = { GameWebSocketClient, app };
