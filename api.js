@@ -1,110 +1,127 @@
-import websocket, base64, threading, time, re
-from flask import Flask, jsonify
-from flask_cors import CORS
+const WebSocket = require("ws");
+const express = require("express");
+const cors = require("cors");
 
-# ======================
-# FLASK
-# ======================
-app = Flask(__name__)
-CORS(app)
+// ======================
+// EXPRESS SERVER
+// ======================
+const app = express();
+app.use(cors());
 
-DATA = {
-    "phien": None,
-    "md5": None,
-    "dice": [],
-    "tong": None,
-    "ketqua": None
+const DATA = {
+    phien: null,
+    md5: null,
+    dice: [],
+    tong: null,
+    ketqua: null
+};
+
+app.get("/68gb", (req, res) => {
+    res.json(DATA);
+});
+
+// ======================
+// WS CONFIG
+// ======================
+const WS_URL = "wss://ugaq8hxbh0nmjhi.cq.qnwxdhwica.com/";
+
+const HANDSHAKE = "AQAAcnsic3lzIjp7InBsYXRmb3JtIjoianMtd2Vic29ja2V0IiwiY2xpZW50QnVpbGROdW1iZXIiOiIwLjAuMSIsImNsaWVudFZlcnNpb24iOiIwYTIxNDgxZDc0NmY5MmY4NDI4ZTFiNmRlZWI3NmZlYSJ9fQ==";
+const LOGIN1 = "AgAAAA==";
+const LOGIN2 = "BAAATQEBAAEIAhDIARpAMzg4N2YzMzJmNGZjNDQ1OGI0NTA3MGI0MjJkYTE1OTFkYjRhNWMzZGYzYjg0YTFkYjc4NzJhMzBkMWI0OTRlZkIA";
+const ENTER_ROOM = "BAAAJQAEIm1ubWRzYi5tbm1kc2JoYW5kbGVyLmVudGVyZ2FtZXJvb20=";
+const GET_SCENE = "BAAAJAAFIW1ubWRzYi5tbm1kc2JoYW5kbGVyLmdldGdhbWVzY2VuZQ==";
+const REQ_POKER = "BAAAJAAGIW1ubWRzYi5tbm1kc2JoYW5kbGVyLnJlcXBva2VyaW5mbw==";
+const HEARTBEAT = "AwAAAA==";
+
+// ======================
+function b64send(ws, data) {
+    ws.send(Buffer.from(data, "base64"));
 }
 
-@app.route("/68gb")
-def api():
-    return jsonify(DATA)
+// ======================
+function startWS() {
+    const ws = new WebSocket(WS_URL);
 
-# ======================
-# WS CONFIG
-# ======================
-WS_URL = "wss://ugaq8hxbh0nmjhi.cq.qnwxdhwica.com/"
+    ws.on("open", () => {
+        console.log("🔌 Connected");
 
-HANDSHAKE = "AQAAcnsic3lzIjp7InBsYXRmb3JtIjoianMtd2Vic29ja2V0IiwiY2xpZW50QnVpbGROdW1iZXIiOiIwLjAuMSIsImNsaWVudFZlcnNpb24iOiIwYTIxNDgxZDc0NmY5MmY4NDI4ZTFiNmRlZWI3NmZlYSJ9fQ=="
-LOGIN1 = "AgAAAA=="
-LOGIN2 = "BAAATQEBAAEIAhDIARpAMzg4N2YzMzJmNGZjNDQ1OGI0NTA3MGI0MjJkYTE1OTFkYjRhNWMzZGYzYjg0YTFkYjc4NzJhMzBkMWI0OTRlZkIA"
-ENTER_ROOM = "BAAAJQAEIm1ubWRzYi5tbm1kc2JoYW5kbGVyLmVudGVyZ2FtZXJvb20="
-GET_SCENE = "BAAAJAAFIW1ubWRzYi5tbm1kc2JoYW5kbGVyLmdldGdhbWVzY2VuZQ=="
-REQ_POKER = "BAAAJAAGIW1ubWRzYi5tbm1kc2JoYW5kbGVyLnJlcXBva2VyaW5mbw=="
-HEARTBEAT = "AwAAAA=="
+        b64send(ws, HANDSHAKE);
 
-# ======================
-def b64send(ws, data):
-    ws.send(base64.b64decode(data))
+        setTimeout(() => {
+            b64send(ws, LOGIN1);
+            b64send(ws, LOGIN2);
+        }, 2000);
 
-def heartbeat(ws):
-    while True:
-        time.sleep(10)
-        try:
-            b64send(ws, HEARTBEAT)
-            ws.send(b'', opcode=websocket.ABNF.OPCODE_PING)
-        except:
-            break
+        setTimeout(() => {
+            b64send(ws, ENTER_ROOM);
+        }, 4000);
 
-# ======================
-# WS EVENTS
-# ======================
-def on_open(ws):
-    b64send(ws, HANDSHAKE)
-    time.sleep(2)
-    b64send(ws, LOGIN1)
-    b64send(ws, LOGIN2)
-    time.sleep(2)
-    b64send(ws, ENTER_ROOM)
-    time.sleep(2)
-    b64send(ws, GET_SCENE)
-    b64send(ws, REQ_POKER)
-    threading.Thread(target=heartbeat, args=(ws,), daemon=True).start()
-    print("✅ WS READY")
+        setTimeout(() => {
+            b64send(ws, GET_SCENE);
+            b64send(ws, REQ_POKER);
+        }, 6000);
 
-def on_message(ws, message):
-    try:
-        text = message.decode(errors="ignore")
+        // Heartbeat
+        setInterval(() => {
+            try {
+                b64send(ws, HEARTBEAT);
+                ws.ping();
+            } catch (e) {}
+        }, 10000);
 
-        # ===== GAME END (LẤY PHIÊN + XÚC XẮC) =====
-        if "mnmdsbgameend" in text:
-            m = re.search(r"#(\d+).*?\{(\d+)-(\d+)-(\d+)\}", text)
-            if m:
-                phien = int(m.group(1)) + 1
-                d1, d2, d3 = map(int, m.groups()[1:])
-                tong = d1 + d2 + d3
-                kq = "TAI" if tong >= 11 else "XIU"
+        console.log("✅ WS READY");
+    });
 
-                DATA.update({
-                    "phien": phien,
-                    "dice": [d1, d2, d3],
-                    "tong": tong,
-                    "ketqua": kq
-                })
+    ws.on("message", (message) => {
+        try {
+            const text = message.toString("utf8");
 
-                print(f"🎲 {d1}-{d2}-{d3} | Tổng {tong} | {kq}")
-                print(f"➡ Phiên kế: {phien}")
+            // ===== GAME END =====
+            if (text.includes("mnmdsbgameend")) {
+                const match = text.match(/#(\d+).*?\{(\d+)-(\d+)-(\d+)\}/);
+                if (match) {
+                    const phien = parseInt(match[1]) + 1;
+                    const d1 = parseInt(match[2]);
+                    const d2 = parseInt(match[3]);
+                    const d3 = parseInt(match[4]);
+                    const tong = d1 + d2 + d3;
+                    const kq = tong >= 11 ? "TAI" : "XIU";
 
-        # ===== GAME START (LẤY MD5) =====
-        if "mnmdsbgamestart" in text:
-            md5 = text[-32:]
-            DATA["md5"] = md5
-            print(f"🔥 MD5: {md5}")
+                    DATA.phien = phien;
+                    DATA.dice = [d1, d2, d3];
+                    DATA.tong = tong;
+                    DATA.ketqua = kq;
 
-    except:
-        pass
+                    console.log(`🎲 ${d1}-${d2}-${d3} | Tổng ${tong} | ${kq}`);
+                    console.log(`➡ Phiên kế: ${phien}`);
+                }
+            }
 
-def start_ws():
-    ws = websocket.WebSocketApp(
-        WS_URL,
-        on_open=on_open,
-        on_message=on_message
-    )
-    ws.run_forever(ping_interval=5, ping_timeout=3)
+            // ===== GAME START =====
+            if (text.includes("mnmdsbgamestart")) {
+                const md5 = text.slice(-32);
+                DATA.md5 = md5;
+                console.log(`🔥 MD5: ${md5}`);
+            }
 
-# ======================
-# START ALL
-# ======================
-threading.Thread(target=start_ws, daemon=True).start()
+        } catch (err) {}
+    });
 
-app.run("0.0.0.0", 3000)
+    ws.on("close", () => {
+        console.log("❌ WS Closed - Reconnecting...");
+        setTimeout(startWS, 3000);
+    });
+
+    ws.on("error", (err) => {
+        console.log("⚠ WS Error:", err.message);
+    });
+}
+
+// ======================
+// START
+// ======================
+startWS();
+
+app.listen(14445, "0.0.0.0", () => {
+    console.log("🚀 API running at http://localhost:14445/68gb");
+});
